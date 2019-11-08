@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/big"
 	"net"
@@ -20,13 +21,56 @@ import (
 )
 
 var (
-	host      = flag.String("host", "", "Comma-separated hostnames and IPs to generate a certificate for")
-	validFrom = flag.String("start-date", "", "Creation date formatted as Jan 1 15:04:05 2011 (default now)")
-	validFor  = flag.Duration("duration", 365*24*time.Hour, "Duration that certificate is valid for")
-	version   = flag.Bool("version", false, "Print the version string")
+	host        = flag.String("host", "", "Comma-separated hostnames and IPs to generate a certificate for")
+	validFrom   = flag.String("start-date", "", "Creation date formatted as Jan 1 15:04:05 2011 (default now)")
+	validFor    = flag.Duration("duration", 365*24*time.Hour, "Duration that certificate is valid for")
+	debug       = flag.Bool("debug", false, "Output debug information (.crt) files")
+	skipIfValid = flag.Bool("skipIfValid", false, "Check existing leaf certificates and skip generation if they are valid")
+	version     = flag.Bool("version", false, "Print the version string")
 )
 
-const Version = "0.1"
+// Version is the version of this tool
+const Version = "0.2"
+
+func verifyCert(rootPEM, certPEM string, name string) error {
+	certfile, e := ioutil.ReadFile(certPEM)
+	if e != nil {
+		fmt.Println("cert file failed to load:", e.Error())
+		os.Exit(1)
+	}
+
+	keyfile, e := ioutil.ReadFile(rootPEM)
+	if e != nil {
+		fmt.Println("key file failed to load:", e.Error())
+		os.Exit(1)
+	}
+
+	roots := x509.NewCertPool()
+	ok := roots.AppendCertsFromPEM(keyfile)
+	if !ok {
+		return fmt.Errorf("failed to parse root certificate")
+	}
+
+	block, _ := pem.Decode(certfile)
+	if block == nil {
+		return fmt.Errorf("failed to parse certificate PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("failed to parse certificate: %v", err.Error())
+	}
+
+	opts := x509.VerifyOptions{
+		DNSName: name,
+		Roots:   roots,
+	}
+
+	if _, err := cert.Verify(opts); err != nil {
+		return fmt.Errorf("failed to verify certificate: %v", err.Error())
+	}
+
+	return nil
+}
 
 func main() {
 	flag.Parse()
@@ -36,6 +80,15 @@ func main() {
 	}
 	if len(*host) == 0 {
 		log.Fatalf("Missing required --host parameter")
+	}
+
+	if true == *skipIfValid {
+		valid := verifyCert("root.pem", "leaf.pem", *host) == nil
+		fmt.Printf("Certificate validity reports as: %t\n", valid)
+		if true == valid {
+			fmt.Println("Skipping Certificate creation.")
+			return
+		}
 	}
 	var err error
 	var notBefore time.Time
@@ -73,14 +126,17 @@ func main() {
 		KeyUsage:              x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA: true,
+		IsCA:                  true,
 	}
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &rootTemplate, &rootTemplate, &rootKey.PublicKey, rootKey)
 	if err != nil {
 		panic(err)
 	}
-	debugCertToFile("root.debug.crt", derBytes)
+	if true == *debug {
+		debugCertToFile("root.debug.crt", derBytes)
+	}
+
 	certToFile("root.pem", derBytes)
 
 	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -104,7 +160,7 @@ func main() {
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA: false,
+		IsCA:                  false,
 	}
 	hosts := strings.Split(*host, ",")
 	for _, h := range hosts {
@@ -119,7 +175,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	debugCertToFile("leaf.debug.crt", derBytes)
+	if true == *debug {
+		debugCertToFile("leaf.debug.crt", derBytes)
+	}
 	certToFile("leaf.pem", derBytes)
 
 	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -139,14 +197,17 @@ func main() {
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
-		IsCA: false,
+		IsCA:                  false,
 	}
 
 	derBytes, err = x509.CreateCertificate(rand.Reader, &clientTemplate, &rootTemplate, &clientKey.PublicKey, rootKey)
 	if err != nil {
 		panic(err)
 	}
-	debugCertToFile("client.debug.crt", derBytes)
+	if true == *debug {
+		debugCertToFile("client.debug.crt", derBytes)
+	}
+
 	certToFile("client.pem", derBytes)
 
 	fmt.Fprintf(os.Stdout, `Successfully generated certificates! Here's what you generated.
